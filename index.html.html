@@ -1,0 +1,264 @@
+<!DOCTYPE html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Litematic Viewer</title>
+<style>
+:root{--bg:#f4f4f2;--pn:#fff;--tx:#1d1d1b;--mu:#6b6b66;--ac:#2f8f4e;--bd:#d8d8d2;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161816;--pn:#222522;--tx:#ecece8;--mu:#9a9d97;--ac:#5fc27f;--bd:#383c37;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#161816;--pn:#222522;--tx:#ecece8;--mu:#9a9d97;--ac:#5fc27f;--bd:#383c37;color-scheme:dark}
+html,body{height:100%;margin:0}
+body{display:flex;background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,sans-serif}
+#side{width:340px;max-width:100%;overflow:auto;padding:12px;background:var(--pn);border-right:1px solid var(--bd)}
+#view{flex:1;position:relative;min-width:0}
+#view canvas{display:block;touch-action:none}
+#hint{position:absolute;left:10px;bottom:10px;background:#000a;color:#fff;padding:6px 10px;border-radius:8px;font-size:12px}
+h2,h3,h4{margin:.4em 0}.mu{color:var(--mu)}
+#drop{display:block;border:2px dashed var(--bd);border-radius:10px;padding:18px;text-align:center;cursor:pointer}
+#drop.on{border-color:var(--ac)}
+button,select,input[type=number]{font:inherit;color:var(--tx);background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:4px 8px}
+button{cursor:pointer}button.act{background:var(--ac);color:#fff;border-color:var(--ac)}
+.row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:8px 0}
+#segs{display:flex;flex-direction:column;gap:4px;margin:8px 0}
+#segs button{text-align:left}
+.chip{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px;border:1px solid #0003}
+.mat{display:flex;justify-content:space-between;gap:8px;padding:2px 0;border-bottom:1px solid var(--bd)}
+canvas#map{max-width:100%;image-rendering:pixelated;border:1px solid var(--bd);display:block}
+@media(max-width:800px){body{flex-direction:column-reverse}#side{width:100%;height:46%;border-right:0;border-top:1px solid var(--bd)}}
+</style></head><body>
+<div id="side">
+<h2>Litematic Viewer</h2>
+<label id="drop">.litematic-Datei hierher ziehen oder klicken<input id="file" type="file" accept=".litematic" hidden></label>
+<div class="row"><button id="demo">Demo-Haus laden</button><label style="cursor:pointer;border:1px solid var(--bd);border-radius:6px;padding:4px 8px">Texturen laden (.jar/.zip)<input id="texf" type="file" accept=".jar,.zip" hidden></label></div><div id="texinfo" class="mu"></div>
+<div id="info" class="mu">Noch nichts geladen.</div>
+<div class="row">Ebenen pro Segment <input id="band" type="number" min="1" max="64" value="4" style="width:60px">
+<select id="mode"><option value="upto">Bis hier gebaut</option><option value="ghost">Rest transparent</option><option value="all">Alles zeigen</option></select></div>
+<div id="segs"></div><div id="tut"></div>
+</div>
+<div id="view"><div id="hint">Ziehen = umschauen · WASD = fliegen · Leertaste hoch · Shift runter · Mausrad = Tempo</div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const $=s=>document.querySelector(s),esc=s=>String(s).replace(/[<&>]/g,c=>({'<':'&lt;','&':'&amp;','>':'&gt;'}[c]));
+/* ---------- NBT + Litematic ---------- */
+function nbt(buf){
+ const dv=new DataView(buf),u8=new Uint8Array(buf),td=new TextDecoder();let p=0;
+ const str=()=>{const l=dv.getUint16(p);p+=2;const s=td.decode(u8.subarray(p,p+l));p+=l;return s};
+ function val(t){switch(t){
+  case 1:return dv.getInt8(p++);
+  case 2:p+=2;return dv.getInt16(p-2);
+  case 3:p+=4;return dv.getInt32(p-4);
+  case 4:p+=8;return Number(dv.getBigInt64(p-8));
+  case 5:p+=4;return dv.getFloat32(p-4);
+  case 6:p+=8;return dv.getFloat64(p-8);
+  case 7:{const n=dv.getInt32(p);p+=4+n;return null}
+  case 8:return str();
+  case 9:{const it=dv.getUint8(p++),n=dv.getInt32(p);p+=4;const a=[];for(let i=0;i<n;i++)a.push(val(it));return a}
+  case 10:{const o={};for(;;){const tt=dv.getUint8(p++);if(!tt)break;const k=str();o[k]=val(tt)}return o}
+  case 11:{const n=dv.getInt32(p);p+=4+4*n;return null}
+  case 12:{const n=dv.getInt32(p);p+=4;const w=new Uint32Array(n*2);for(let i=0;i<n;i++){w[2*i+1]=dv.getUint32(p);w[2*i]=dv.getUint32(p+4);p+=8}return w}
+ }}
+ p++;str();return val(10);
+}
+async function gunzip(buf){
+ try{return await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer()}catch(e){return buf}
+}
+function fromLitematic(root){
+ const mn=[1e9,1e9,1e9],mx=[-1e9,-1e9,-1e9],K=['x','y','z'];
+ const R=Object.values(root.Regions).map(r=>{
+  const o=K.map(k=>{const a=r.Position[k],s=r.Size[k];return s<0?a+s+1:a}),sz=K.map(k=>Math.abs(r.Size[k]));
+  o.forEach((v,i)=>{mn[i]=Math.min(mn[i],v);mx[i]=Math.max(mx[i],v+sz[i])});return{r,o,sz}});
+ const dim=[0,1,2].map(i=>mx[i]-mn[i]);
+ if(dim[0]*dim[1]*dim[2]>9e7)throw Error('Bauwerk ist zu groß für den Browser');
+ const g=new Uint16Array(dim[0]*dim[1]*dim[2]),names=['air'],ids={air:0};
+ for(const{r,o,sz}of R){
+  const pal=r.BlockStatePalette.map(e=>{const n=e.Name.replace('minecraft:','');if(!(n in ids)){ids[n]=names.length;names.push(n)}return ids[n]});
+  const bits=Math.max(2,Math.ceil(Math.log2(pal.length))),mask=bits>=32?-1:(1<<bits)-1,w=r.BlockStates,n=sz[0]*sz[1]*sz[2];
+  const ox=o[0]-mn[0],oy=o[1]-mn[1],oz=o[2]-mn[2];
+  for(let i=0;i<n;i++){
+   const bp=i*bits,wi=bp>>>5,off=bp&31;let v=w[wi]>>>off;
+   if(off+bits>32)v|=(w[wi+1]||0)<<(32-off);
+   v&=mask;
+   const x=i%sz[0],z=((i/sz[0])|0)%sz[2],y=(i/(sz[0]*sz[2]))|0;
+   g[ox+x+dim[0]*(oz+z+dim[2]*(oy+y))]=pal[v];
+  }}
+ return{g,names,dim,title:Object.keys(root.Regions).join(', ')};
+}
+function demo(){
+ const X=15,Y=14,Z=13,g=new Uint16Array(X*Y*Z),names=['air','stone_bricks','oak_planks','dark_oak_log','glass','spruce_planks'];
+ const S=(x,y,z,v)=>g[x+X*(z+Z*y)]=v;
+ for(let x=0;x<X;x++)for(let z=0;z<Z;z++){S(x,0,z,1);
+  for(let y=1;y<=5;y++){const e=x==0||z==0||x==X-1||z==Z-1;if(!e)continue;
+   const c=(x==0||x==X-1)&&(z==0||z==Z-1);let v=c?3:2;
+   if(!c&&y>=3&&y<=4&&((z==0||z==Z-1)?x%4==2:z%4==2))v=4;
+   if(z==0&&x==7&&y<=2)v=0;S(x,y,z,v)}}
+ for(let k=0;k<=6;k++)for(let x=k;x<X-k;x++)for(let z=k;z<Z-k;z++)if(x==k||z==k||x==X-1-k||z==Z-1-k||k==6)S(x,6+k,z,5);
+ return{g,names,dim:[X,Y,Z],title:'Demo-Haus'};
+}
+/* ---------- Farben ---------- */
+const COLS={light_blue:[.4,.65,.9],light_gray:[.6,.6,.6],white:[.92,.92,.92],orange:[.9,.5,.15],magenta:[.75,.3,.75],yellow:[.95,.85,.2],lime:[.5,.8,.15],pink:[.95,.6,.7],gray:[.3,.3,.3],cyan:[.1,.55,.6],purple:[.5,.2,.7],blue:[.2,.25,.7],brown:[.4,.27,.15],green:[.3,.4,.15],red:[.7,.2,.2],black:[.1,.1,.12]};
+const RULES=[['water',[.2,.4,.85]],['lava',[.95,.45,.1]],['grass',[.35,.65,.25]],['leaves',[.2,.5,.2]],['dark_oak',[.28,.18,.09]],['spruce',[.4,.28,.15]],['birch',[.8,.75,.55]],['jungle',[.6,.42,.28]],['acacia',[.7,.4,.22]],['cherry',[.9,.65,.7]],['oak',[.65,.52,.3]],['deepslate',[.25,.25,.28]],['blackstone',[.18,.16,.2]],['stone_brick',[.5,.5,.5]],['cobble',[.45,.45,.45]],['andesite',[.55,.55,.55]],['diorite',[.8,.8,.8]],['granite',[.6,.4,.35]],['stone',[.5,.5,.5]],['brick',[.6,.3,.25]],['sand',[.85,.8,.55]],['dirt',[.5,.35,.22]],['snow',[.95,.95,.98]],['quartz',[.92,.9,.88]],['glass',[.7,.85,.9]],['obsidian',[.1,.05,.18]],['netherrack',[.45,.2,.2]],['iron',[.8,.8,.8]],['gold',[.95,.8,.2]],['diamond',[.4,.85,.85]],['copper',[.75,.45,.3]],['prismarine',[.3,.6,.55]],['glowstone',[1,.85,.5]],['lantern',[1,.8,.4]]];
+function color(n){
+ for(const k in COLS)if(n.startsWith(k+'_'))return n.includes('terracotta')?COLS[k].map(v=>v*.8):COLS[k];
+ for(const[k,c]of RULES)if(n.includes(k))return c;
+ let h=0;for(const ch of n)h=(h*31+ch.charCodeAt(0))>>>0;
+ const a=(h%360)/60,f=a%1,q=.45,t=.45+.35*f,u=.8-.35*f;
+ return[[.8,t,q],[u,.8,q],[q,.8,t],[q,u,.8],[t,q,.8],[.8,q,u]][a|0];
+}
+/* ---------- 16x16 Texturen (prozedural) ---------- */
+let atlasTex,AC,acols=1;
+/* ---------- Original-Texturen aus client.jar / Resource-Pack (lokal im Browser) ---------- */
+const TEX={};
+async function readZip(buf){
+ const dv=new DataView(buf),u8=new Uint8Array(buf);let e=buf.byteLength-22;
+ while(e>=0&&dv.getUint32(e,true)!==0x06054b50)e--;
+ if(e<0)throw Error('Keine gültige jar/zip-Datei');
+ const n=dv.getUint16(e+10,true),out=[];let p=dv.getUint32(e+16,true);
+ for(let i=0;i<n;i++){
+  const m=dv.getUint16(p+10,true),cs=dv.getUint32(p+20,true),nl=dv.getUint16(p+28,true),el=dv.getUint16(p+30,true),cl=dv.getUint16(p+32,true),lo=dv.getUint32(p+42,true);
+  const name=new TextDecoder().decode(u8.subarray(p+46,p+46+nl));p+=46+nl+el+cl;
+  const mm=name.match(/^assets\/minecraft\/textures\/block\/([^\/]+)\.png$/);if(!mm)continue;
+  const d=lo+30+dv.getUint16(lo+26,true)+dv.getUint16(lo+28,true);
+  out.push([mm[1],m,u8.subarray(d,d+cs)])}
+ return out}
+async function loadTex(f){
+ $('#texinfo').textContent='Lese Texturen …';
+ try{const list=await readZip(await f.arrayBuffer());let c=0;
+  for(const[n,m,data]of list){
+   const raw=m==8?await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer():data;
+   const bmp=await createImageBitmap(new Blob([raw],{type:'image/png'}));
+   const t=document.createElement('canvas');t.width=t.height=16;const x=t.getContext('2d');x.imageSmoothingEnabled=false;x.drawImage(bmp,0,0,bmp.width,bmp.width,0,0,16,16);TEX[n]=t;c++}
+  $('#texinfo').textContent=c?c+' Original-Texturen geladen':'Keine Block-Texturen in der Datei gefunden';M&&build()}
+ catch(e){$('#texinfo').textContent='Fehler: '+e.message}
+}
+function tinted(t,c){if(!c)return t;const o=document.createElement('canvas');o.width=o.height=16;const x=o.getContext('2d');x.drawImage(t,0,0);const d=x.getImageData(0,0,16,16);for(let i=0;i<d.data.length;i+=4)for(let j=0;j<3;j++)d.data[i+j]*=c[j];x.putImageData(d,0,0);return o}
+function findTex(name,k){
+ if(!TEX.stone)return null;
+ const GR=[.57,.74,.35],LF=[.47,.67,.18],WA=[.25,.46,.89];
+ let b=name.replace(/_(stairs|slab|wall|fence_gate|fence|button|pressure_plate)$/,'');
+ b={water:'water_still',lava:'lava_still',quartz:'quartz_block'}[b]||b;
+ if(b=='grass_block'){if(k==0&&TEX.grass_block_top)return tinted(TEX.grass_block_top,GR);if(k==2)return TEX.dirt;
+  if(TEX.grass_block_side){const o=document.createElement('canvas');o.width=o.height=16;const x=o.getContext('2d');x.drawImage(TEX.grass_block_side,0,0);if(TEX.grass_block_side_overlay)x.drawImage(tinted(TEX.grass_block_side_overlay,GR),0,0);return o}}
+ const suf=k==0?['_top','']:k==2?['_bottom','_top','']:['_side',''];
+ for(const base of[b,b+'s',b+'_planks',b+'_block'])for(const s of suf){const t=TEX[base+s];if(t)return tinted(t,b=='water_still'?WA:/leaves$/.test(b)&&!/cherry|azalea/.test(b)?LF:null)}
+ return null}
+function rng(s){let h=1779033703;for(const ch of s)h=Math.imul(h^ch.charCodeAt(0),2654435761);return()=>{h+=0x6D2B79F5;let t=Math.imul(h^h>>>15,1|h);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function paint(cx,ox,oy,n,k,c){
+ const R=rng(n+k),has=s=>n.includes(s),dirt=[.5,.35,.22];
+ const stoneish=/stone|cobble|deepslate|andesite|diorite|granite|netherrack|dirt|sand|gravel|blackstone|obsidian|ore|terracotta/.test(n);
+ for(let y=0;y<16;y++)for(let x=0;x<16;x++){
+  let f=.93+R()*.14,a=1,cc=c;
+  if(has('grass_block')){if(k==1){if(y<3||(y==3&&R()<.5)){}else cc=dirt}else if(k==2)cc=dirt}
+  else if(has('planks')){if(y%4==3)f*=.68;else if(x==((y>>2)%2?3:11))f*=.8}
+  else if(/_log|_wood/.test(n)){if(k==1)f=(x%4==0?.72:x%4==2?1.08:.92)*(.96+R()*.08);else{const d=Math.max(Math.abs(x-7.5),Math.abs(y-7.5));f=(d>6.5?.7:(d|0)%2?1:.86)*(.96+R()*.08);if(d<=6.5)cc=c.map(v=>Math.min(1,v*1.3))}}
+  else if(has('brick')){const m=y%4==3||(x+((y>>2)%2?4:0))%8==7;if(m){if(has('stone'))f*=.6;else{cc=[.72,.72,.7];f=.95}}}
+  else if(has('leaves')){if(R()<.2)f=.45}
+  else if(has('glass')){const e=x==0||y==0||x==15||y==15;a=e?.95:.3;if(!e&&x==y&&x>2&&x<7)a=.8}
+  else if(has('water'))a=.65;
+  else if(stoneish){f=.8+R()*.3;if(R()<.08)f*=.75}
+  cx.fillStyle=`rgba(${cc.map(v=>Math.min(255,v*f*255)|0)},${a})`;cx.fillRect(ox+x,oy+y,1,1)}
+}
+function makeAtlas(nm,col){
+ acols=Math.ceil(Math.sqrt(nm.length*3));AC=document.createElement('canvas');AC.width=AC.height=acols*16;
+ const cx=AC.getContext('2d');
+ nm.forEach((name,id)=>{if(!id)return;for(let k=0;k<3;k++){const t=id*3+k,ox=(t%acols)*16,oy=((t/acols)|0)*16;paint(cx,ox,oy,name,k,col[id]);const r=findTex(name,k);if(r){cx.clearRect(ox,oy,16,16);cx.drawImage(r,ox,oy)}}});
+ atlasTex&&atlasTex.dispose();atlasTex=new THREE.CanvasTexture(AC);atlasTex.magFilter=atlasTex.minFilter=THREE.NearestFilter;atlasTex.generateMipmaps=false;
+}
+/* ---------- Szene ---------- */
+const view=$('#view'),renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));view.prepend(renderer.domElement);
+const scene=new THREE.Scene(),cam=new THREE.PerspectiveCamera(70,1,.1,3000),grp=new THREE.Group();
+scene.add(grp);cam.rotation.order='YXZ';
+const dark=matchMedia('(prefers-color-scheme: dark)').matches;scene.background=new THREE.Color(dark?0x1a2230:0x9fc5e8);
+function resize(){const w=view.clientWidth,h=view.clientHeight;renderer.setSize(w,h);cam.aspect=w/h;cam.updateProjectionMatrix()}
+addEventListener('resize',resize);
+let yaw=0,pitch=0,speed=10;
+function look(from,to){cam.position.copy(from);const d=to.clone().sub(from);yaw=Math.atan2(-d.x,-d.z);pitch=Math.atan2(d.y,Math.hypot(d.x,d.z))}
+const keys={};addEventListener('keydown',e=>{if(e.target.tagName!='INPUT')keys[e.code]=1});addEventListener('keyup',e=>keys[e.code]=0);
+view.addEventListener('wheel',e=>{e.preventDefault();speed=Math.max(1,Math.min(300,speed*(e.deltaY<0?1.2:1/1.2)))},{passive:false});
+let drag=null;const cv=renderer.domElement;
+cv.addEventListener('pointerdown',e=>{drag=e;cv.setPointerCapture(e.pointerId)});
+cv.addEventListener('pointerup',()=>drag=null);
+cv.addEventListener('pointermove',e=>{if(!drag)return;yaw-=(e.clientX-drag.clientX)*.004;pitch=Math.max(-1.55,Math.min(1.55,pitch-(e.clientY-drag.clientY)*.004));drag=e});
+let last=0;
+(function loop(t){requestAnimationFrame(loop);const dt=Math.min(.1,(t-last)/1000);last=t;
+ cam.rotation.set(pitch,yaw,0);
+ const f=new THREE.Vector3(-Math.sin(yaw)*Math.cos(pitch),Math.sin(pitch),-Math.cos(yaw)*Math.cos(pitch)),r=new THREE.Vector3(Math.cos(yaw),0,-Math.sin(yaw));
+ const m=new THREE.Vector3().addScaledVector(f,(keys.KeyW|0)-(keys.KeyS|0)).addScaledVector(r,(keys.KeyD|0)-(keys.KeyA|0));
+ m.y+=(keys.Space|0)-((keys.ShiftLeft|keys.ShiftRight)|0);
+ cam.position.addScaledVector(m,speed*dt);renderer.render(scene,cam)})(0);
+/* ---------- Bauwerk & Segmente ---------- */
+let M,segs=[],sel=0,band=4,lay=0,col=[],css=[];
+const DIRS=[[1,0,0,.8,[[1,0,0],[1,1,0],[1,1,1],[1,0,1]]],[-1,0,0,.8,[[0,0,0],[0,0,1],[0,1,1],[0,1,0]]],[0,1,0,1,[[0,1,0],[0,1,1],[1,1,1],[1,1,0]]],[0,-1,0,.5,[[0,0,0],[1,0,0],[1,0,1],[0,0,1]]],[0,0,1,.68,[[0,0,1],[1,0,1],[1,1,1],[0,1,1]]],[0,0,-1,.68,[[0,0,0],[0,1,0],[1,1,0],[1,0,0]]]];
+function build(){
+ while(grp.children.length){const o=grp.children.pop();o.geometry.dispose();o.material.dispose()}
+ const[X,Y,Z]=M.dim,g=M.g,nm=M.names;band=Math.max(1,+$('#band').value||4);
+ col=nm.map(color);css=col.map(c=>`rgb(${c.map(v=>v*255|0)})`);makeAtlas(nm,col);
+ const air=nm.map(n=>/^(air|cave_air|void_air)$/.test(n)),tr=nm.map(n=>/glass|leaves|water|^ice/.test(n));
+ segs=Array.from({length:Math.ceil(Y/band)},()=>({p:[],c:[],u:[],i:[],tot:0,cnt:{}}));
+ for(let y=0;y<Y;y++){const s=segs[(y/band)|0];
+  for(let z=0;z<Z;z++)for(let x=0;x<X;x++){
+   const id=g[x+X*(z+Z*y)];if(!id||air[id])continue;s.cnt[id]=(s.cnt[id]||0)+1;s.tot++;
+   for(const[dx,dy,dz,sh,q]of DIRS){
+    const nx=x+dx,ny=y+dy,nz=z+dz;
+    const nid=(nx<0||ny<0||nz<0||nx>=X||ny>=Y||nz>=Z)?0:g[nx+X*(nz+Z*ny)];
+    if(nid&&!air[nid]&&!(tr[nid]&&nid!==id))continue;
+    const b=s.p.length/3,c=col[id];
+    const t=id*3+(dy>0?0:dy<0?2:1),tx=t%acols,ty=(t/acols)|0,W=acols*16;
+    for(const v of q){s.p.push(x+v[0],y+v[1],z+v[2]);s.c.push(sh,sh,sh);
+     const cu=dy?v[0]:dx?v[2]:v[0],cv=dy?v[2]:v[1];
+     s.u.push((tx*16+.5+cu*15)/W,1-(ty*16+.5+(1-cv)*15)/W)}
+    s.i.push(b,b+1,b+2,b,b+2,b+3);}}}
+ segs.forEach(s=>{const ge=new THREE.BufferGeometry();
+  ge.setAttribute('position',new THREE.Float32BufferAttribute(s.p,3));ge.setAttribute('color',new THREE.Float32BufferAttribute(s.c,3));ge.setAttribute('uv',new THREE.Float32BufferAttribute(s.u,2));ge.setIndex(s.i);
+  s.mesh=new THREE.Mesh(ge,new THREE.MeshBasicMaterial({map:atlasTex,alphaTest:.1,vertexColors:true,side:THREE.DoubleSide,transparent:true}));grp.add(s.mesh);s.p=s.c=s.u=s.i=null});
+ const gr=new THREE.GridHelper(Math.max(X,Z)*2,Math.max(X,Z)*2,0x888888,0x888888);gr.position.set(X/2,-.01,Z/2);gr.material.opacity=.3;gr.material.transparent=true;grp.add(gr);
+ speed=Math.max(X,Y,Z)/3;
+ const list=$('#segs');list.innerHTML='';
+ segs.forEach((s,i)=>{if(!s.tot)return;const b=document.createElement('button');b.id='sb'+i;
+  b.textContent=`Segment ${i+1} · Ebene ${i*band}–${Math.min(Y,(i+1)*band)-1} · ${s.tot} Blöcke`;b.onclick=()=>pick(i);list.appendChild(b)});
+ const first=segs.findIndex(s=>s.tot);pick(first<0?0:first,true);
+ const c=new THREE.Vector3(X/2,Y/2,Z/2),d=Math.max(X,Y,Z);look(c.clone().add(new THREE.Vector3(d*.9,d*.7,d*1.1)),c);
+}
+function pick(i,noFocus){
+ sel=i;lay=0;document.querySelectorAll('#segs button').forEach(b=>b.classList.toggle('act',b.id=='sb'+i));
+ vis();tut();if(noFocus)return;
+ const[X,,Z]=M.dim,y=Math.min(M.dim[1],(i+.5)*band),c=new THREE.Vector3(X/2,y,Z/2),d=Math.max(X,Z,band*2);
+ look(c.clone().add(new THREE.Vector3(d*.7,d*.6,d*.9)),c);
+}
+function vis(){const m=$('#mode').value;segs.forEach((s,i)=>{const mt=s.mesh.material;
+ s.mesh.visible=m=='upto'?i<=sel:true;const full=m!='ghost'||i==sel;mt.opacity=full?1:.07;mt.depthWrite=full})}
+function tut(){
+ const[X,Y,Z]=M.dim,s=segs[sel],y0=sel*band,y1=Math.min(Y,y0+band)-1;if(!s)return;
+ const y=y0+lay,mats=Object.entries(s.cnt).sort((a,b)=>b[1]-a[1]);
+ const lc={};let ln=0;for(let z=0;z<Z;z++)for(let x=0;x<X;x++){const id=M.g[x+X*(z+Z*y)];if(id&&!/air$/.test(M.names[id])){lc[id]=(lc[id]||0)+1;ln++}}
+ const ls=Object.entries(lc).sort((a,b)=>b[1]-a[1]);
+ $('#tut').innerHTML=`<h3>Tutorial: Segment ${sel+1}</h3><div class="mu">Ebene ${y0}–${y1} · Fläche ${X}×${Z} · ${s.tot} Blöcke</div>
+ <h4>Material</h4>${mats.map(([id,n])=>`<div class="mat"><span><span class="chip" style="background:${css[id]}"></span>${esc(M.names[id])}</span><span>${n} (${n>>6} Stacks + ${n%64})</span></div>`).join('')}
+ <h4>Schritt für Schritt</h4>
+ <div class="row"><button id="pv">◀</button><b>Ebene ${y} (${lay+1}/${y1-y0+1})</b><button id="nx">▶</button></div>
+ <p>${ln?`Baue ${ln} Blöcke. Starte oben links in der Karte (x 0, z 0) und arbeite dich Reihe für Reihe nach unten. ${ls.length>1?`Setze zuerst das Hauptmaterial <b>${esc(M.names[ls[0][0]])}</b>, danach die Details.`:''}`:'Diese Ebene ist leer.'}</p>
+ <canvas id="map"></canvas><div id="hov" class="mu">Mit der Maus über die Karte fahren</div>
+ ${ls.map(([id,n])=>`<div class="mat"><span><span class="chip" style="background:${css[id]}"></span>${esc(M.names[id])}</span><span>${n}×</span></div>`).join('')}
+ <p class="mu">Karte: x → Osten, z → Süden, relativ zur Schematic. Hinweis: Treppen/Slabs werden als ganze Blöcke gezeigt.</p>`;
+ $('#pv').onclick=()=>{lay=Math.max(0,lay-1);tut()};$('#nx').onclick=()=>{lay=Math.min(y1-y0,lay+1);tut()};
+ const c=$('#map'),cell=Math.max(2,Math.min(14,Math.floor(300/Math.max(X,Z))));c.width=X*cell;c.height=Z*cell;
+ const cx=c.getContext('2d');cx.imageSmoothingEnabled=false;cx.fillStyle=dark?'#111':'#eee';cx.fillRect(0,0,c.width,c.height);
+ for(let z=0;z<Z;z++)for(let x=0;x<X;x++){const id=M.g[x+X*(z+Z*y)];if(!id||/air$/.test(M.names[id]))continue;const t=id*3;cx.drawImage(AC,(t%acols)*16,((t/acols)|0)*16,16,16,x*cell,z*cell,cell,cell)}
+ if(cell>=8){cx.strokeStyle='#0003';for(let i=0;i<=X;i++){cx.beginPath();cx.moveTo(i*cell,0);cx.lineTo(i*cell,c.height);cx.stroke()}for(let i=0;i<=Z;i++){cx.beginPath();cx.moveTo(0,i*cell);cx.lineTo(c.width,i*cell);cx.stroke()}}
+ c.onmousemove=e=>{const r=c.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)/r.width*X),z=Math.floor((e.clientY-r.top)/r.height*Z);
+  const id=M.g[x+X*(z+Z*y)];$('#hov').textContent=`x ${x}, y ${y}, z ${z}: ${id?M.names[id]:'air'}`};
+}
+/* ---------- Laden ---------- */
+async function load(f){
+ $('#info').textContent='Lade '+f.name+' …';
+ try{const root=nbt(await gunzip(await f.arrayBuffer()));set(fromLitematic(root),f.name)}
+ catch(e){$('#info').textContent='Fehler beim Lesen: '+e.message}
+}
+function set(m,name){M=m;const[X,Y,Z]=m.dim;let n=0;for(const v of m.g)if(v&&!/air$/.test(m.names[v]))n++;
+ $('#info').textContent=`${name}: ${X}×${Y}×${Z}, ${n} Blöcke, ${m.names.length-1} Blocktypen`;build()}
+$('#file').onchange=e=>e.target.files[0]&&load(e.target.files[0]);
+$('#demo').onclick=()=>set(demo(),'Demo-Haus');$('#texf').onchange=e=>e.target.files[0]&&loadTex(e.target.files[0]);
+$('#band').onchange=()=>M&&build();$('#mode').onchange=()=>M&&vis();
+addEventListener('dragover',e=>{e.preventDefault();$('#drop').classList.add('on')});
+addEventListener('dragleave',()=>$('#drop').classList.remove('on'));
+addEventListener('drop',e=>{e.preventDefault();$('#drop').classList.remove('on');const f=e.dataTransfer.files[0];f&&(/\.(jar|zip)$/i.test(f.name)?loadTex(f):load(f))});
+resize();
+</script></body></html>
